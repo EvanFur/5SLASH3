@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>5/3 Tracker</title>
+
+<!-- Firebase SDK -->
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/11.0.0/firebase-app.js";
+import { getAuth, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.0.0/firebase-auth.js";
+import {
+  getFirestore, doc, getDoc, setDoc, addDoc,
+  collection, query, orderBy, limit, getDocs
+} from "https://www.gstatic.com/firebasejs/11.0.0/firebase-firestore.js";
+
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+
+// ── Constants ────────────────────────────────────────────────────────────────
+const LIFTS = ['squat', 'bench', 'deadlift', 'ohp'];
+const LIFT_LABELS = { squat: 'Squat', bench: 'Bench', deadlift: 'Deadlift', ohp: 'OHP' };
+const INCREMENTS = { squat: 5, deadlift: 5, bench: 2.5, ohp: 2.5 };
+const WEEK_TYPES = [false, true, false, true, false, true, null]; // false=5s, true=3s, null=deload
+const SETS_5  = [[0.65, 5], [0.75, 5], [0.85, 5]];
+const SETS_3  = [[0.70, 3], [0.80, 3], [0.90, 3]];
+const SETS_DL = [[0.40, 5], [0.50, 5], [0.60, 5]];
+
+function round(val) { return Math.round(val / 2.5) * 2.5; }
+
+// ── State ────────────────────────────────────────────────────────────────────
+let uid = null;
+let state = null; // { tms, cycleWeek, reps, cycleNumber }
+
+// ── Firestore helpers ────────────────────────────────────────────────────────
+function stateRef()   { return doc(db, 'users', uid, 'data', 'state'); }
+function historyCol() { return collection(db, 'users', uid, 'history'); }
+
+async function loadStateFromDB() {
+  const snap = await getDoc(stateRef());
+  return snap.exists() ? snap.data() : null;
+}
+
+async function saveStateToDB() {
+  await setDoc(stateRef(), state);
+}
+
+async function logWeekToDB(weekSnapshot) {
+  // weekSnapshot = { cycleWeek, cycleNumber, weekType, tms, reps, completedAt }
+  await addDoc(historyCol(), weekSnapshot);
+}
+
+async function loadHistory() {
+  const q = query(historyCol(), orderBy('completedAt', 'desc'), limit(20));
+  const snap = await getDocs(q);
+  return snap.docs.map(d => d.data());
+}
+
+// ── Auth + Boot ──────────────────────────────────────────────────────────────
+const provider = new GoogleAuthProvider();
+
+window.signInWithGoogle = async () => {
+  try {
+    await signInWithPopup(auth, provider);
+  } catch (e) {
+    alert('Sign-in failed. Please try again.');
+    showScreen('signin');
+  }
+};
+
+window.signOutUser = async () => {
+  if (!confirm('Sign out?')) return;
+  await signOut(auth);
+};
+
+onAuthStateChanged(auth, async (user) => {
+  try {
+    if (user) {
+      uid = user.uid;
+      const avatar = document.getElementById('user-avatar');
+      if (avatar) avatar.textContent = (user.displayName || user.email || '?')[0].toUpperCase();
+
+      state = await loadStateFromDB();
+      if (state && !state.deleted) {
+        showScreen('app');
+        render();
+      } else {
+        showScreen('setup');
+      }
+      showStatus('');
+    } else {
+      showScreen('signin');
+      showStatus('');
+    }
+  } catch (error) {
+    console.error('Firestore load failed:', error);
+    showStatus('');
+    alert('Unable to access your workout data. Make sure Firestore rules are deployed and you are signed in.');
+    showScreen('signin');
+  }
+});
+
+// ── Setup ────────────────────────────────────────────────────────────────────
+window.startProgram = async () => {
+  const tms = {};
+  for (const lift of LIFTS) {
+    const val = parseFloat(document.getElementById(`tm-${lift}`).value);
+    if (!val || val < 5) { alert(`Enter a valid TM for ${LIFT_LABELS[lift]}`); return; }
+    tms[lift] = val;
+  }
+  state = { tms, cycleWeek: 1, cycleNumber: 1, reps: {} };
+  showStatus('Saving…');
+  await saveStateToDB();
+  showScreen('app');
+  render();
+};
+
+// ── Render ───────────────────────────────────────────────────────────────────
+function render() {
+  const cw = state.cycleWeek;
+  const weekType = WEEK_TYPES[cw - 1];
+  const isDeload = weekType === null;
+  const is3Week  = weekType === true;
+
+  // Header
+  const badge = document.getElementById('week-badge');
+  badge.className = 'week-badge' + (isDeload ? ' deload' : '');
+  document.getElementById('week-label').textContent = `Week ${cw}`;
+  document.getElementById('week-type-label').textContent =
+    isDeload ? 'Deload' : is3Week ? '3s Week' : '5s Week';
+  document.getElementById('cycle-number').textContent = `Cycle ${state.cycleNumber ?? 1}`;
+
+  // Cycle pips
+  const bar = document.getElementById('cycle-bar');
+  bar.innerHTML = '';
+  for (let i = 1; i <= 7; i++) {
+    const pip = document.createElement('div');
+    pip.className = 'cycle-pip' +
+      (i < cw ? ' done' : i === cw ? ' active' + (isDeload ? ' deload-pip' : '') : '');
+    bar.appendChild(pip);
+  }
+
+  // Lifts
+  const container = document.getElementById('lifts-container');
+  container.innerHTML = '';
+  const sets = isDeload ? SETS_DL : is3Week ? SETS_3 : SETS_5;
+
+  for (const lift of LIFTS) {
+    const tm = state.tms[lift];
+    const savedReps = state.reps[lift] ?? null;
+    const card = document.createElement('div');
+    card.className = 'lift-card';
+
+    let tableHTML = `
+      <div class="lift-header">
+        <span class="lift-name">${LIFT_LABELS[lift]}</span>
+        <span class="lift-tm">TM <strong>${tm} kg</strong></span>
+      </div>
+      <div class="sets-body">
+        <table class="sets-table">
+          <thead><tr><th>Set</th><th>Weight</th><th>Reps</th></tr></thead>
+          <tbody>`;
+
+    sets.forEach(([pct, reps], idx) => {
+      const weight = round(tm * pct);
+      const isTop = idx === sets.length - 1;
+      let repsCell;
+      if (isTop && !isDeload) {
+        const inputVal = savedReps !== null ? savedReps : '';
+        repsCell = `<td>
+          <input class="rep-input${savedReps !== null ? ' saved' : ''}" type="number"
+            min="0" max="99" id="rep-${lift}" value="${inputVal}" placeholder="${reps}+"
+            onchange="saveRep('${lift}', this.value)"
+            ${savedReps !== null ? 'style="color:var(--accent)"' : ''}>
+        </td>`;
+      } else {
+        repsCell = `<td><span class="set-reps">${reps}</span></td>`;
+      }
+      tableHTML += `<tr><td>${idx+1}</td><td>${weight} kg</td>${repsCell}</tr>`;
+    });
+
+    tableHTML += `</tbody></table>`;
+
+    if (!isDeload) {
+      tableHTML += `<button class="done-btn" id="done-${lift}"
+        ${savedReps !== null ? '' : 'disabled'}
+        onclick="markDone('${lift}')">
+        ${savedReps !== null ? '✓ Logged' : 'Log top set'}
+      </button>`;
+    }
+
+    tableHTML += `</div>`;
+    card.innerHTML = tableHTML;
+    container.appendChild(card);
+  }
+
+  renderNotice(is3Week, isDeload);
+
+  // Next btn
+  const nextBtn = document.getElementById('next-btn');
+  nextBtn.textContent = isDeload ? 'Complete Deload →'
+    : cw === 7 ? 'Complete Cycle →' : 'Next Week →';
+  nextBtn.disabled = !isDeload && !LIFTS.every(l => state.reps[l] != null);
+}
+
+function renderNotice(is3Week, isDeload) {
+  const notice = document.getElementById('weight-notice');
+  if (!is3Week || isDeload) { notice.className = 'notice'; return; }
+  const increases = [];
+  for (const lift of LIFTS) {
+    const reps = state.reps[lift];
+    if (reps != null && reps >= 3)
+      increases.push(`${LIFT_LABELS[lift]}: ${state.tms[lift]} → <strong>${state.tms[lift] + INCREMENTS[lift]} kg</strong>`);
+  }
+  notice.className = 'notice visible';
+  notice.innerHTML = increases.length
+    ? 'Ready to increase: ' + increases.join(' · ')
+    : 'Log top sets above. 3+ reps = TM goes up next week.';
+}
+
+// ── Interactions ─────────────────────────────────────────────────────────────
+window.saveRep = (lift, val) => {
+  const num = parseInt(val, 10);
+  state.reps[lift] = isNaN(num) ? null : num;
+  const input = document.getElementById(`rep-${lift}`);
+  if (input && state.reps[lift] !== null) input.style.color = 'var(--accent)';
+  const doneBtn = document.getElementById(`done-${lift}`);
+  if (doneBtn) doneBtn.disabled = state.reps[lift] === null;
+  renderNotice(WEEK_TYPES[state.cycleWeek - 1] === true, false);
+  document.getElementById('next-btn').disabled =
+    !LIFTS.every(l => state.reps[l] != null);
+  // Debounce save
+  clearTimeout(window._saveTimer);
+  window._saveTimer = setTimeout(() => saveStateToDB(), 800);
+};
+
+window.markDone = (lift) => {
+  const btn = document.getElementById(`done-${lift}`);
+  if (btn) btn.textContent = '✓ Logged';
+};
+
+window.advanceWeek = async () => {
+  const cw = state.cycleWeek;
+  const weekType = WEEK_TYPES[cw - 1];
+  const is3Week = weekType === true;
+  const isDeload = weekType === null;
+  const weekTypeLabel = isDeload ? 'deload' : is3Week ? '3s' : '5s';
+
+  // Log this week to history
+  await logWeekToDB({
+    cycleWeek: cw,
+    cycleNumber: state.cycleNumber ?? 1,
+    weekType: weekTypeLabel,
+    tms: { ...state.tms },
+    reps: { ...state.reps },
+    completedAt: new Date().toISOString()
+  });
+
+  // Apply TM increases after 3s weeks
+  if (is3Week) {
+    for (const lift of LIFTS) {
+      if ((state.reps[lift] ?? 0) >= 3)
+        state.tms[lift] += INCREMENTS[lift];
+    }
+  }
+
+  state.reps = {};
+  if (cw >= 7) {
+    state.cycleWeek = 1;
+    state.cycleNumber = (state.cycleNumber ?? 1) + 1;
+  } else {
+    state.cycleWeek = cw + 1;
+  }
+
+  showStatus('Saving…');
+  await saveStateToDB();
+  showStatus('');
+  render();
+};
+
+window.showHistory = async () => {
+  const panel = document.getElementById('history-panel');
+  if (panel.classList.contains('open')) {
+    panel.classList.remove('open');
+    return;
+  }
+  panel.classList.add('open');
+  panel.innerHTML = '<p class="history-loading">Loading…</p>';
+  const history = await loadHistory();
+  if (!history.length) {
+    panel.innerHTML = '<p class="history-loading">No history yet.</p>';
+    return;
+  }
+  panel.innerHTML = history.map(w => {
+    const date = new Date(w.completedAt).toLocaleDateString('en-IE', { day: 'numeric', month: 'short' });
+    const repStr = w.weekType === 'deload' ? 'Deload' :
+      LIFTS.map(l => `${LIFT_LABELS[l]} ×${w.reps[l] ?? '—'}`).join(' · ');
+    return `<div class="history-row">
+      <div class="history-meta">Cycle ${w.cycleNumber} · Wk ${w.cycleWeek} <span class="history-type">${w.weekType}</span></div>
+      <div class="history-date">${date}</div>
+      <div class="history-reps">${repStr}</div>
+    </div>`;
+  }).join('');
+};
+
+window.confirmReset = async () => {
+  if (!confirm('Reset all progress and training maxes?')) return;
+  state = null;
+  await setDoc(stateRef(), { deleted: true });
+  showScreen('setup');
+};
+
+// ── UI helpers ───────────────────────────────────────────────────────────────
+function showScreen(name) {
+  document.getElementById('status-screen').style.display  = 'none';
+  document.getElementById('signin-screen').style.display  = name === 'signin' ? 'flex' : 'none';
+  document.getElementById('setup-screen').style.display   = name === 'setup'  ? 'block' : 'none';
+  document.getElementById('app-screen').style.display     = name === 'app'    ? 'block' : 'none';
+}
+
+function showStatus(msg) {
+  if (!msg) { document.getElementById('status-screen').style.display = 'none'; return; }
+  document.getElementById('status-screen').style.display = 'flex';
+  document.getElementById('status-msg').textContent = msg;
+}
+</script>
+
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;500&display=swap');
+
+  :root {
+    --bg: #111111; --surface: #1a1a1a; --border: #2a2a2a;
+    --accent: #c8f135; --muted: #555; --text: #e8e8e8;
+    --text-dim: #888; --deload: #4a7fa5;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: 'IBM Plex Sans', sans-serif;
+    min-height: 100vh; padding: 24px 16px 80px;
+    max-width: 480px; margin: 0 auto;
+  }
+
+  /* Status overlay */
+  #status-screen {
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh; font-family: 'IBM Plex Mono', monospace;
+    font-size: 13px; color: var(--text-dim);
+  }
+
+  /* Header */
+  header {
+    display: flex; justify-content: space-between; align-items: flex-end;
+    margin-bottom: 28px; border-bottom: 1px solid var(--border); padding-bottom: 14px;
+  }
+  h1 { font-family: 'IBM Plex Mono', monospace; font-size: 20px; font-weight: 600; }
+  .week-badge { font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--text-dim); text-align: right; line-height: 1.5; }
+  .week-badge span { display: block; font-size: 15px; font-weight: 600; color: var(--accent); }
+  .week-badge.deload span { color: var(--deload); }
+  #cycle-number { font-size: 11px !important; color: var(--muted) !important; font-weight: 400 !important; }
+
+  /* Cycle bar */
+  .cycle-bar { display: flex; gap: 3px; margin-bottom: 24px; }
+  .cycle-pip { flex: 1; height: 4px; border-radius: 2px; background: var(--border); transition: background 0.2s; }
+  .cycle-pip.done { background: var(--muted); }
+  .cycle-pip.active { background: var(--accent); }
+  .cycle-pip.active.deload-pip { background: var(--deload); }
+
+  /* Lift cards */
+  .lifts { display: flex; flex-direction: column; gap: 12px; }
+  .lift-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .lift-header { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; }
+  .lift-name { font-family: 'IBM Plex Mono', monospace; font-size: 14px; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase; }
+  .lift-tm { font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: var(--text-dim); }
+  .lift-tm strong { color: var(--text); }
+
+  /* Sets table */
+  .sets-body { padding: 0 16px 14px; }
+  .sets-table { width: 100%; border-collapse: collapse; font-family: 'IBM Plex Mono', monospace; font-size: 13px; }
+  .sets-table th { text-align: left; color: var(--text-dim); font-weight: 400; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; padding: 0 0 8px; }
+  .sets-table th:last-child, .sets-table td:last-child { text-align: right; }
+  .sets-table td { padding: 5px 0; vertical-align: middle; }
+  .set-reps { color: var(--text-dim); font-size: 12px; }
+  .rep-input {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+    color: var(--text); font-family: 'IBM Plex Mono', monospace; font-size: 14px;
+    width: 52px; height: 30px; text-align: center; outline: none; transition: border-color 0.15s;
+  }
+  .rep-input:focus { border-color: var(--accent); }
+  .rep-input.saved { border-color: var(--muted); }
+
+  /* Buttons */
+  .done-btn {
+    margin-top: 10px; width: 100%; padding: 9px; background: transparent;
+    border: 1px solid var(--accent); border-radius: 6px; color: var(--accent);
+    font-family: 'IBM Plex Mono', monospace; font-size: 13px; cursor: pointer; letter-spacing: 0.5px; transition: background 0.15s, color 0.15s;
+  }
+  .done-btn:hover { background: var(--accent); color: var(--bg); }
+  .done-btn:disabled { opacity: 0.35; cursor: default; }
+  .done-btn:disabled:hover { background: transparent; color: var(--accent); }
+
+  .notice { margin-top: 14px; padding: 10px 14px; border-radius: 6px; border: 1px solid var(--border); font-size: 12px; color: var(--text-dim); line-height: 1.5; display: none; }
+  .notice.visible { display: block; }
+  .notice strong { color: var(--accent); font-family: 'IBM Plex Mono', monospace; }
+
+  /* Footer */
+  .footer-actions { margin-top: 24px; display: flex; gap: 10px; }
+  .next-btn {
+    flex: 1; padding: 12px; background: var(--accent); border: none; border-radius: 8px;
+    color: var(--bg); font-family: 'IBM Plex Mono', monospace; font-size: 14px; font-weight: 600;
+    cursor: pointer; transition: opacity 0.15s;
+  }
+  .next-btn:hover { opacity: 0.88; }
+  .next-btn:disabled { opacity: 0.3; cursor: default; }
+
+  .icon-btn {
+    padding: 12px 14px; background: transparent; border: 1px solid var(--border);
+    border-radius: 8px; color: var(--text-dim); font-size: 16px; cursor: pointer; transition: border-color 0.15s;
+  }
+  .icon-btn:hover { border-color: var(--text-dim); }
+  .reset-btn { padding: 12px 14px; background: transparent; border: 1px solid var(--border); border-radius: 8px; color: var(--text-dim); font-family: 'IBM Plex Mono', monospace; font-size: 13px; cursor: pointer; transition: border-color 0.15s, color 0.15s; }
+  .reset-btn:hover { border-color: #c0392b; color: #c0392b; }
+
+  /* History panel */
+  #history-panel {
+    display: none; flex-direction: column; gap: 10px;
+    margin-top: 20px; max-height: 340px; overflow-y: auto;
+  }
+  #history-panel.open { display: flex; }
+  .history-loading { color: var(--text-dim); font-size: 13px; padding: 8px 0; }
+  .history-row {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+    padding: 10px 14px; display: grid; grid-template-columns: 1fr auto; gap: 2px 8px;
+  }
+  .history-meta { font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--text-dim); }
+  .history-type { color: var(--accent); }
+  .history-date { font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--muted); text-align: right; }
+  .history-reps { font-size: 12px; color: var(--text-dim); grid-column: 1 / -1; margin-top: 2px; }
+
+  /* Sign-in screen */
+  #signin-screen {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    min-height: 100vh; gap: 32px; text-align: center;
+  }
+  #signin-screen h1 { font-size: 24px; }
+  #signin-screen p { color: var(--text-dim); font-size: 13px; max-width: 260px; line-height: 1.6; }
+  .google-btn {
+    display: flex; align-items: center; gap: 10px;
+    padding: 12px 20px; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; color: var(--text); font-family: 'IBM Plex Sans', sans-serif;
+    font-size: 14px; cursor: pointer; transition: border-color 0.15s;
+  }
+  .google-btn:hover { border-color: var(--accent); }
+  .google-btn svg { flex-shrink: 0; }
+
+  /* User avatar / sign-out */
+  .user-btn {
+    background: transparent; border: 1px solid var(--border); border-radius: 50%;
+    width: 30px; height: 30px; color: var(--text-dim); font-family: 'IBM Plex Mono', monospace;
+    font-size: 12px; font-weight: 600; cursor: pointer; transition: border-color 0.15s;
+    display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+  }
+  .user-btn:hover { border-color: #c0392b; color: #c0392b; }
+  .header-left { display: flex; align-items: center; gap: 10px; }
+
+  /* Setup */
+  #setup-screen { padding-top: 40px; }
+  #setup-screen h2 { font-family: 'IBM Plex Mono', monospace; font-size: 16px; margin-bottom: 6px; }
+  #setup-screen p { color: var(--text-dim); font-size: 13px; margin-bottom: 28px; line-height: 1.5; }
+  .setup-field { margin-bottom: 16px; }
+  .setup-field label { display: block; font-family: 'IBM Plex Mono', monospace; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-dim); margin-bottom: 6px; }
+  .setup-field input { width: 100%; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-family: 'IBM Plex Mono', monospace; font-size: 16px; padding: 10px 14px; outline: none; transition: border-color 0.15s; }
+  .setup-field input:focus { border-color: var(--accent); }
+  .start-btn { width: 100%; margin-top: 10px; padding: 13px; background: var(--accent); border: none; border-radius: 8px; color: var(--bg); font-family: 'IBM Plex Mono', monospace; font-size: 14px; font-weight: 600; cursor: pointer; }
+  .start-btn:hover { opacity: 0.88; }
+</style>
+</head>
+<body>
+
+<!-- Loading -->
+<div id="status-screen">
+  <span id="status-msg">Connecting…</span>
+</div>
+
+<!-- Sign-in -->
+<div id="signin-screen" style="display:none">
+  <div>
+    <h1>5/3 Tracker</h1>
+  </div>
+  <p>Sign in with Google to keep your history across all your devices.</p>
+  <button class="google-btn" onclick="signInWithGoogle()">
+    <svg width="18" height="18" viewBox="0 0 18 18"><path fill="#4285F4" d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844c-.209 1.125-.843 2.078-1.796 2.717v2.258h2.908c1.702-1.567 2.684-3.874 2.684-6.615z"/><path fill="#34A853" d="M9 18c2.43 0 4.467-.806 5.956-2.18l-2.908-2.259c-.806.54-1.837.86-3.048.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.332A8.997 8.997 0 0 0 9 18z"/><path fill="#FBBC05" d="M3.964 10.71A5.41 5.41 0 0 1 3.682 9c0-.593.102-1.17.282-1.71V4.958H.957A8.996 8.996 0 0 0 0 9c0 1.452.348 2.827.957 4.042l3.007-2.332z"/><path fill="#EA4335" d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0A8.997 8.997 0 0 0 .957 4.958L3.964 6.29C4.672 4.163 6.656 3.58 9 3.58z"/></svg>
+    Continue with Google
+  </button>
+</div>
+
+<!-- Setup -->
+<div id="setup-screen" style="display:none">
+  <h1>5/3 Tracker</h1><br>
+  <h2>Enter your training maxes</h2>
+  <p>Use ~90% of your actual 1RM. Weights in kg.</p>
+  <div class="setup-field"><label>Squat TM (kg)</label><input type="number" id="tm-squat" placeholder="e.g. 100" min="20" step="2.5"></div>
+  <div class="setup-field"><label>Bench TM (kg)</label><input type="number" id="tm-bench" placeholder="e.g. 80" min="20" step="2.5"></div>
+  <div class="setup-field"><label>Deadlift TM (kg)</label><input type="number" id="tm-deadlift" placeholder="e.g. 120" min="20" step="2.5"></div>
+  <div class="setup-field"><label>OHP TM (kg)</label><input type="number" id="tm-ohp" placeholder="e.g. 55" min="10" step="2.5"></div>
+  <button class="start-btn" onclick="startProgram()">Start Program</button>
+</div>
+
+<!-- App -->
+<div id="app-screen" style="display:none">
+  <header>
+    <div class="header-left">
+      <h1>5/3 Tracker</h1>
+      <button class="user-btn" id="user-avatar" onclick="signOutUser()" title="Sign out">?</button>
+    </div>
+    <div class="week-badge" id="week-badge">
+      <span id="week-label">Week 1</span>
+      <span id="cycle-number">Cycle 1</span>
+      <span id="week-type-label" style="font-size:11px;color:var(--text-dim)">5s Week</span>
+    </div>
+  </header>
+
+  <div class="cycle-bar" id="cycle-bar"></div>
+  <div class="lifts" id="lifts-container"></div>
+  <div class="notice" id="weight-notice"></div>
+
+  <div class="footer-actions">
+    <button class="next-btn" id="next-btn" onclick="advanceWeek()">Next Week →</button>
+    <button class="icon-btn" onclick="showHistory()" title="History">📋</button>
+    <button class="reset-btn" onclick="confirmReset()">Reset</button>
+  </div>
+
+  <div id="history-panel"></div>
+</div>
+
+</body>
+</html>
